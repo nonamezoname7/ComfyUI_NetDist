@@ -50,6 +50,39 @@ class NodeName:
 ### Remote Communication
 All HTTP communication uses the `requests` library with 4-second timeouts for control endpoints and 16-second timeouts for data transfer. Jobs are tracked by client ID (session-unique) and job ID (timestamp-based).
 
+### Input Resource Upload Pattern
+When dispatching workflows to remote instances, local file references must be uploaded first. This is handled in `dispatch.py` via `upload_input_images()`.
+
+**Pattern for extending to other node types:**
+1. In `upload_input_images()` (or a new similar function), detect nodes by `class_type`
+2. Extract the file reference from the node's `inputs` dict
+3. Resolve the local path using `folder_paths.get_annotated_filepath()`
+4. Upload to remote via ComfyUI's `/upload/image` API (POST multipart form)
+5. Update the prompt with the new filename if it changed
+
+**Currently supported:**
+- `LoadImage` → uploads via `/upload/image`
+
+**Candidates for future support:**
+- `LoadImageMask` → `/upload/image` (same pattern as LoadImage)
+- `LoadVideo` (if exists) → would need video upload handling
+- Custom nodes that load local files
+
+**ComfyUI Upload API reference:**
+```python
+# POST /upload/image - multipart form data
+files = {"image": (filename, file_handle)}
+data = {"type": "input", "overwrite": "true", "subfolder": "optional"}
+response = requests.post(f"{remote_url}/upload/image", files=files, data=data)
+# Returns: {"name": "actual_filename.png", "subfolder": "", "type": "input"}
+```
+
+**File path annotation format:**
+- `"filename.png"` → resolves to input directory (default)
+- `"filename.png[output]"` → resolves to output directory
+- `"filename.png[temp]"` → resolves to temp directory
+- `"subfolder/filename.png"` → resolves to subfolder within input directory
+
 ## Dependencies
 
 Single external dependency: `requests`
