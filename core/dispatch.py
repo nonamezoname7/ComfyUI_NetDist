@@ -8,7 +8,69 @@ import numpy as np
 from PIL import Image
 from copy import deepcopy
 
+import folder_paths
 from .utils import clean_url, get_client_id
+
+
+def upload_input_images(remote_url, prompt):
+	"""
+	Find LoadImage nodes in prompt, upload their images to remote,
+	and update prompt with new filenames if needed.
+
+	Args:
+		remote_url (str): Remote ComfyUI instance URL.
+		prompt (dict): Workflow prompt dictionary.
+
+	Returns:
+		dict: Modified prompt (or original if no changes needed).
+	"""
+	for node_id, node in prompt.items():
+		if node.get("class_type") != "LoadImage":
+			continue
+
+		image_ref = node.get("inputs", {}).get("image")
+		if not image_ref:
+			continue
+
+		# Resolve local path using ComfyUI's path resolution
+		local_path = folder_paths.get_annotated_filepath(image_ref)
+		if not os.path.exists(local_path):
+			print(f"NetDist: Warning - image not found: {local_path}")
+			continue
+
+		# Parse annotation if present (e.g., "file.png[output]")
+		if "[" in image_ref:
+			filename = image_ref.split("[")[0]
+			upload_type = image_ref.split("[")[1].rstrip("]")
+		else:
+			filename = image_ref
+			upload_type = "input"
+
+		# Upload to remote
+		print(f"NetDist: Uploading {filename} to {remote_url}...")
+		with open(local_path, "rb") as f:
+			files = {"image": (filename, f)}
+			data = {"type": upload_type, "overwrite": "true"}
+			r = requests.post(
+				f"{remote_url}/upload/image",
+				files=files,
+				data=data,
+				timeout=30
+			)
+			r.raise_for_status()
+			result = r.json()
+
+		# Update prompt if filename changed (due to remote's duplicate handling)
+		new_filename = result.get("name", filename)
+		if new_filename != filename:
+			new_ref = f"{new_filename}[{upload_type}]" if upload_type != "input" else new_filename
+			prompt[node_id]["inputs"]["image"] = new_ref
+			print(f"NetDist: Uploaded {filename} -> {new_filename}")
+		else:
+			print(f"NetDist: Uploaded {filename}")
+
+	return prompt
+
 
 def clear_remote_queue(remote_url):
 	r = requests.get(f"{remote_url}/queue", timeout=4)
@@ -57,6 +119,10 @@ def get_output_nodes(remote_url):
 def dispatch_to_remote(remote_url, prompt, job_id=f"{get_client_id()}-unknown", outputs="final_image"):
 	### PROMPT LOGIC ###
 	prompt = deepcopy(prompt)
+
+	# Upload input images to remote before processing
+	prompt = upload_input_images(remote_url, prompt)
+
 	to_del = []
 	def recursive_node_deletion(start_node):
 		target_nodes = [start_node]
@@ -136,5 +202,8 @@ def dispatch_to_remote(remote_url, prompt, job_id=f"{get_client_id()}-unknown", 
 		headers = {"Content-Type": "application/json"},
 		timeout = 4,
 	)
+	if not ar.ok:
+		print(f"NetDist: Remote server rejected prompt with status {ar.status_code}")
+		print(f"NetDist: Response: {ar.text}")
 	ar.raise_for_status()
 	return
