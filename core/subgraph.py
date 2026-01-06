@@ -290,6 +290,8 @@ def wait_for_subgraph_job(remote_url, job_id):
         list: List of output image info dicts, or empty list.
     """
     fail_count = 0
+    poll_count = 0
+    print(f"NetDist: Waiting for remote job to complete...")
     while fail_count <= 3:
         try:
             r = requests.get(f"{remote_url}/history", timeout=4)
@@ -302,6 +304,9 @@ def wait_for_subgraph_job(remote_url, job_id):
 
         data = r.json()
         if not data:
+            poll_count += 1
+            if poll_count % 10 == 0:
+                print(f"NetDist: Still waiting... ({poll_count * POLLING_INTERVAL:.1f}s)")
             time.sleep(POLLING_INTERVAL)
             continue
 
@@ -311,6 +316,7 @@ def wait_for_subgraph_job(remote_url, job_id):
             if extra_data.get("job_id") == job_id:
                 outputs = job_data.get("outputs", {})
                 if outputs:
+                    print(f"NetDist: Remote job complete, fetching output...")
                     # Find node with final_output flag or use last
                     inputs_data = job_data.get("prompt", [None, None, {}])[2]
                     for node_id, node_inputs in inputs_data.items():
@@ -321,6 +327,9 @@ def wait_for_subgraph_job(remote_url, job_id):
                     return outputs[last_node].get("images", [])
                 return []
 
+        poll_count += 1
+        if poll_count % 10 == 0:
+            print(f"NetDist: Still waiting... ({poll_count * POLLING_INTERVAL:.1f}s)")
         time.sleep(POLLING_INTERVAL)
 
     raise OSError(f"NetDist: Failed to fetch subgraph output after {fail_count} failures")

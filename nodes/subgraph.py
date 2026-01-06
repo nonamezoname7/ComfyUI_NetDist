@@ -67,6 +67,7 @@ class RemoteSubgraphQueue:
             raise ValueError(f"NetDist: trigger must be a link, got {type(trigger)}")
 
         if mode == "local":
+            print(f"NetDist: Subgraph mode=local, skipping remote dispatch")
             return ({
                 "mode": "local",
                 "trigger_link": trigger,
@@ -74,6 +75,7 @@ class RemoteSubgraphQueue:
 
         remote_url = clean_url(remote_url)
         trigger_node_id = trigger[0]
+        print(f"NetDist: Extracting subgraph from trigger node {trigger_node_id}...")
 
         # Extract subgraph by tracing upstream from trigger node
         subgraph_nodes = extract_subgraph_from_dynprompt(dynprompt, trigger_node_id)
@@ -81,17 +83,22 @@ class RemoteSubgraphQueue:
         if not subgraph_nodes:
             raise ValueError("NetDist: No subgraph found - nothing to execute")
 
+        print(f"NetDist: Found {len(subgraph_nodes)} nodes in subgraph")
+
         # Build the prompt dict from dynprompt
         prompt = {}
         for node_id in subgraph_nodes:
             prompt[node_id] = dynprompt.get_node(node_id)
 
         # Prepare and dispatch
+        print(f"NetDist: Preparing subgraph for {remote_url}...")
         subgraph_prompt = prepare_subgraph_prompt(
             prompt, subgraph_nodes, trigger, remote_url
         )
         job_id = get_new_job_id()
+        print(f"NetDist: Dispatching subgraph (job_id={job_id})...")
         dispatch_subgraph(remote_url, subgraph_prompt, job_id)
+        print(f"NetDist: Subgraph dispatched, waiting for fetch...")
 
         return ({
             "mode": "remote",
@@ -138,6 +145,7 @@ class SubgraphFetch_IMAGE:
         mode = remote_info.get("mode", "remote")
 
         if mode == "local":
+            print("NetDist: Fetch mode=local, using local_image")
             if local_image is not None:
                 return (local_image,)
             raise ValueError("NetDist: Local mode requires local_image input")
@@ -149,11 +157,13 @@ class SubgraphFetch_IMAGE:
         if not remote_url or not job_id:
             raise ValueError("NetDist: Missing remote_url or job_id in remote_info")
 
+        print(f"NetDist: Fetching IMAGE from {remote_url} (job_id={job_id})...")
         result = fetch_subgraph_image(remote_url, job_id)
 
         if result is None:
             raise ValueError("NetDist: Failed to fetch image from remote")
 
+        print(f"NetDist: Fetch complete, image shape={result.shape}")
         return (result,)
 
 
