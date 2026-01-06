@@ -2,176 +2,260 @@
 
 ## Overview
 
-Execute portions of a workflow on remote ComfyUI instances. Only `SubgraphOutput_*` marker nodes are needed - the subgraph is automatically extracted from the main workflow by tracing upstream from the output markers.
+Execute portions of a workflow on remote ComfyUI instances. The subgraph is automatically extracted from the main workflow by tracing upstream from a queue node.
+
+**Pattern:** (consistent with existing NetDist nodes)
+- `RemoteSubgraphQueue` → extracts subgraph, dispatches, returns REMINFO
+- `SubgraphFetch_*` → receives REMINFO, fetches specific output
 
 ---
 
-## Simplified Architecture
+## Node Architecture
 
-**Key insight:** The subgraph IS part of the main workflow. We extract it dynamically by:
-1. Tracing upstream from `SubgraphOutput_*` nodes
-2. Detecting boundary inputs (whitelisted types entering the subgraph)
-3. Converting to a standalone prompt with injected loader nodes
+### 7 Total Nodes:
 
-**Only output marker nodes needed:**
-- `SubgraphOutput_IMAGE`
-- `SubgraphOutput_LATENT`
-- `SubgraphOutput_MASK`
-- `SubgraphOutput_INT`
-- `SubgraphOutput_FLOAT`
-- `SubgraphOutput_STRING`
+| Node | Purpose |
+|------|---------|
+| `RemoteSubgraphQueue` | Extract subgraph, upload inputs, dispatch, return REMINFO |
+| `SubgraphFetch_IMAGE` | Fetch IMAGE output from remote |
+| `SubgraphFetch_LATENT` | Fetch LATENT output from remote |
+| `SubgraphFetch_MASK` | Fetch MASK output from remote |
+| `SubgraphFetch_INT` | Fetch INT output from remote |
+| `SubgraphFetch_FLOAT` | Fetch FLOAT output from remote |
+| `SubgraphFetch_STRING` | Fetch STRING output from remote |
 
 ---
 
-## Node Definition
+## Node Definitions
 
-### SubgraphOutput_* (one per whitelisted type)
+### RemoteSubgraphQueue (dispatch node)
 
 ```
 ┌─────────────────────────────────┐
-│   SubgraphOutput_IMAGE          │
+│   RemoteSubgraphQueue           │
 ├─────────────────────────────────┤
 │ remote_url: [http://...]        │
 │ mode: [local/remote/both]       │
-│ output_name: "result"           │
 ├─────────────────────────────────┤
 │ Inputs:                         │
-│  → image     (IMAGE)            │
+│  → trigger    (any type)        │  ← connects to end of subgraph
 ├─────────────────────────────────┤
 │ Outputs:                        │
-│  → image     (IMAGE)            │
+│  → remote_info (REMINFO)        │
 └─────────────────────────────────┘
 │ Hidden:                         │
 │  → prompt    (PROMPT)           │
+│  → unique_id (UNIQUE_ID)        │
 └─────────────────────────────────┘
 ```
 
 **Behavior:**
-- `local` mode: passthrough (returns input image directly)
-- `remote` mode: extracts subgraph, dispatches, fetches result
-- `both` mode: executes locally AND remotely (for comparison)
+- Traces upstream from `trigger` input to identify subgraph
+- Detects boundary inputs (whitelisted types)
+- Uploads IMAGE/LATENT boundaries to remote
+- Builds standalone prompt with injected loaders
+- Dispatches to remote `/prompt`
+- Returns REMINFO with job_id for fetch nodes
+
+### SubgraphFetch_* (fetch nodes)
+
+```
+┌─────────────────────────────────┐
+│   SubgraphFetch_IMAGE           │
+├─────────────────────────────────┤
+│ output_name: "result"           │
+├─────────────────────────────────┤
+│ Inputs:                         │
+│  → remote_info (REMINFO)        │
+│  → local_value (IMAGE) optional │  ← for local/both modes
+├─────────────────────────────────┤
+│ Outputs:                        │
+│  → image     (IMAGE)            │
+└─────────────────────────────────┘
+```
+
+**Behavior:**
+- `local` mode (in REMINFO): returns local_value passthrough
+- `remote` mode: polls /history, fetches output by output_name
+- `both` mode: could return both or compare
+
+---
+
+## Workflow Example
+
+### Main Workflow
+
+```
+┌───────────┐     ┌──────────────┐     ┌──────────────┐     ┌─────────────────────┐
+│ LoadImage │────→│ VAEEncode    │────→│ KSampler     │────→│ VAEDecode           │
+└───────────┘     └──────────────┘     └──────────────┘     └─────────────────────┘
+                                                                      │
+                        ┌─────────────────────────────────────────────┘
+                        ↓
+            ┌───────────────────────────┐
+            │ RemoteSubgraphQueue       │
+            │ remote_url: 192.168.1.68  │
+            │ mode: remote              │
+            └───────────────────────────┘
+                        │
+                        ↓ REMINFO
+            ┌───────────────────────────┐
+            │ SubgraphFetch_IMAGE       │────→ [SaveImage]
+            │ output_name: "image_out"  │
+            └───────────────────────────┘
+```
+
+### What Gets Sent to Remote
+
+The queue node traces upstream and extracts:
+
+```python
+{
+  "1": {"class_type": "LoadCheckpoint", "inputs": {"ckpt_name": "model.safetensors"}},
+  "2": {"class_type": "LoadImage", "inputs": {"image": "uploaded_input.png"}},  # uploaded
+  "3": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
+  "4": {"class_type": "KSampler", "inputs": {...}},
+  "5": {"class_type": "VAEDecode", "inputs": {"samples": ["4", 0], "vae": ["1", 2]}},
+  "6": {"class_type": "PreviewImage", "inputs": {"images": ["5", 0]}}  # capture node
+}
+```
 
 ---
 
 ## Subgraph Extraction Process
 
-### Example Workflow
+### Step 1: Trace Upstream
 
+Starting from RemoteSubgraphQueue's trigger input, recursively find all upstream nodes:
+
+```python
+def extract_subgraph(prompt, start_node_id):
+    subgraph_nodes = set()
+    to_visit = [start_node_id]
+
+    while to_visit:
+        node_id = to_visit.pop()
+        if node_id in subgraph_nodes:
+            continue
+        subgraph_nodes.add(node_id)
+
+        node = prompt[node_id]
+        for input_value in node["inputs"].values():
+            if is_link(input_value):
+                upstream_id = input_value[0]
+                to_visit.append(upstream_id)
+
+    return subgraph_nodes
 ```
-Main workflow prompt:
-{
-  "1": {"class_type": "LoadCheckpoint", "inputs": {"ckpt_name": "model.safetensors"}},
-  "2": {"class_type": "LoadImage", "inputs": {"image": "photo.png"}},
-  "3": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
-  "4": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "latent_image": ["3", 0], ...}},
-  "5": {"class_type": "VAEDecode", "inputs": {"samples": ["4", 0], "vae": ["1", 2]}},
-  "6": {"class_type": "SubgraphOutput_IMAGE", "inputs": {"image": ["5", 0], "remote_url": "..."}}
-}
-```
-
-### Step 1: Trace Upstream from Output
-
-Starting from node "6" (SubgraphOutput_IMAGE), trace all upstream dependencies:
-- Node 6 depends on: 5
-- Node 5 depends on: 4, 1
-- Node 4 depends on: 1, 3
-- Node 3 depends on: 2, 1
-- Nodes 1, 2 have no upstream dependencies
-
-Subgraph nodes: {1, 2, 3, 4, 5, 6}
 
 ### Step 2: Identify Boundary Inputs
 
-Find inputs to subgraph nodes that come from OUTSIDE or are whitelisted entry points:
-- Node 2 (LoadImage): `image` = "photo.png" → **IMAGE boundary** (file reference)
-- Node 1 (LoadCheckpoint): `ckpt_name` = "model.safetensors" → **NOT whitelisted** (remote loads its own)
-
-Since MODEL/VAE/CLIP aren't whitelisted, they stay as-is (remote has same models).
-
-The only boundary input to handle: the image from LoadImage.
-
-### Step 3: Convert to Standalone Prompt
+Find nodes in subgraph that load external resources:
 
 ```python
-# Extracted subgraph (sent to remote):
-{
-  "1": {"class_type": "LoadCheckpoint", "inputs": {"ckpt_name": "model.safetensors"}},
-  "2": {"class_type": "LoadImage", "inputs": {"image": "uploaded_photo.png"}},  # uploaded file
-  "3": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
-  "4": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "latent_image": ["3", 0], ...}},
-  "5": {"class_type": "VAEDecode", "inputs": {"samples": ["4", 0], "vae": ["1", 2]}},
-  "6": {"class_type": "PreviewImage", "inputs": {"images": ["5", 0]}}  # replaced output node
+LOADER_NODES = {
+    "LoadImage": ("image", "IMAGE"),
+    "LoadLatent": ("latent", "LATENT"),
+    # etc.
 }
+
+def find_boundary_inputs(prompt, subgraph_nodes):
+    boundaries = []
+    for node_id in subgraph_nodes:
+        node = prompt[node_id]
+        if node["class_type"] in LOADER_NODES:
+            boundaries.append((node_id, node))
+    return boundaries
 ```
 
-**Changes made:**
-1. LoadImage now references uploaded file
-2. SubgraphOutput_IMAGE replaced with PreviewImage (capture node)
+### Step 3: Upload and Inject
+
+For each boundary input:
+1. Read the local file
+2. Upload to remote via `/upload/image`
+3. Update the node's input to reference uploaded filename
+
+### Step 4: Replace Output Node
+
+Replace RemoteSubgraphQueue with a capture node:
+
+```python
+# Original: RemoteSubgraphQueue with trigger input from node "5"
+# Replace with: PreviewImage capturing that output
+
+prompt[queue_node_id] = {
+    "class_type": "PreviewImage",
+    "inputs": {"images": trigger_link}
+}
+```
 
 ---
 
 ## Boundary Input Handling
 
-### For Each Whitelisted Type:
+### Whitelisted Types:
 
-| Type | At Boundary | Injection | Capture |
-|------|-------------|-----------|---------|
-| `IMAGE` | Upload to remote | `LoadImage` with uploaded filename | `PreviewImage` |
-| `LATENT` | Upload .npy file | `LoadLatentNumpy` with uploaded filename | `SaveLatentNumpy` |
-| `MASK` | Upload to remote | `LoadImage` (single channel) | `PreviewImage` |
-| `INT` | Direct injection | Replace link with value | Store in metadata |
-| `FLOAT` | Direct injection | Replace link with value | Store in metadata |
-| `STRING` | Direct injection | Replace link with value | Store in metadata |
+| Type | Loader Node | Capture Node | Upload Method |
+|------|-------------|--------------|---------------|
+| `IMAGE` | `LoadImage` | `PreviewImage` | `/upload/image` |
+| `LATENT` | `LoadLatentNumpy` | `SaveLatentNumpy` | `/upload/image` (.npy) |
+| `MASK` | `LoadImage` | `PreviewImage` | `/upload/image` |
+| `INT` | Direct injection | Metadata | In prompt JSON |
+| `FLOAT` | Direct injection | Metadata | In prompt JSON |
+| `STRING` | Direct injection | Metadata | In prompt JSON |
 
-### Non-Whitelisted Types (stay as-is):
+### Non-Whitelisted (stay as-is):
 
 | Type | Handling |
 |------|----------|
 | `MODEL` | Remote loads same checkpoint by name |
 | `CLIP` | Remote loads same checkpoint by name |
 | `VAE` | Remote loads same checkpoint by name |
-| `CONDITIONING` | Included in subgraph, regenerated on remote |
+| `CONDITIONING` | Regenerated on remote |
 
 ---
 
 ## Execution Flow
 
 ```
-1. SubgraphOutput_* node executes
-2. Read current workflow via hidden "prompt" input
-3. Trace upstream to identify subgraph nodes
-4. Identify boundary inputs (whitelisted types from outside)
+1. RemoteSubgraphQueue executes
+2. Read workflow via hidden "prompt" input
+3. Trace upstream from trigger to find subgraph nodes
+4. Find boundary inputs (loader nodes for whitelisted types)
 5. For each IMAGE/LATENT boundary:
+   - Read local file
    - Upload to remote via /upload/image
-   - Note the uploaded filename
-6. Build standalone prompt:
-   - Copy subgraph nodes
-   - Replace boundary inputs with loader nodes (uploaded files)
-   - Replace SubgraphOutput_* with capture node
+   - Update prompt with uploaded filename
+6. Replace queue node with capture node in prompt
 7. Dispatch prompt to remote /prompt
-8. Poll /history for completion
-9. Fetch result:
-   - IMAGE: GET /view?filename=...
-   - LATENT: GET /view?filename=...
-   - Primitives: Extract from job metadata
-10. Return fetched value
+8. Return REMINFO with job_id, remote_url, mode
+
+9. SubgraphFetch_* nodes execute (after receiving REMINFO)
+10. If mode == "local": return local_value
+11. If mode == "remote":
+    - Poll /history for job completion
+    - Fetch output by output_name:
+      - IMAGE: GET /view?filename=...
+      - LATENT: GET /view?filename=...
+      - Primitives: Extract from metadata
+12. Return fetched value
 ```
 
 ---
 
 ## Multiple Outputs
 
-For multiple outputs, use multiple SubgraphOutput_* nodes:
-
 ```
-[Processing] → [SubgraphOutput_IMAGE "img_result"]
-           ↘ → [SubgraphOutput_LATENT "lat_result"]
+[Processing] ────→ [RemoteSubgraphQueue]
+                           │
+                           ↓ REMINFO
+         ┌─────────────────┼─────────────────┐
+         ↓                 ↓                 ↓
+[SubgraphFetch_IMAGE] [SubgraphFetch_LATENT] [SubgraphFetch_INT]
+ output_name: "img"    output_name: "lat"    output_name: "steps"
 ```
 
-**Coordination:**
-- First SubgraphOutput_* to execute dispatches the subgraph
-- Others detect same job_id and just fetch their specific output
-- Use shared REMINFO via node metadata or execution cache
+Each fetch node requests its specific output by name from the same job.
 
 ---
 
@@ -180,18 +264,17 @@ For multiple outputs, use multiple SubgraphOutput_* nodes:
 ### `nodes/subgraph.py` (NEW)
 
 ```python
-class SubgraphOutput_IMAGE:
-    TITLE = "Subgraph Output (Image)"
+class RemoteSubgraphQueue:
+    TITLE = "Queue Subgraph on Remote"
     CATEGORY = "remote/subgraph"
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image": ("IMAGE",),
+                "trigger": ("*",),  # accepts any type
                 "remote_url": ("STRING", {"default": "http://127.0.0.1:8288"}),
                 "mode": (["local", "remote", "both"],),
-                "output_name": ("STRING", {"default": "image_out"}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -199,23 +282,54 @@ class SubgraphOutput_IMAGE:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "execute"
+    RETURN_TYPES = ("REMINFO",)
+    FUNCTION = "queue"
 
-    def execute(self, image, remote_url, mode, output_name, prompt, unique_id):
+    def queue(self, trigger, remote_url, mode, prompt, unique_id):
         if mode == "local":
-            return (image,)
+            return ({"mode": "local"},)
 
-        # Extract subgraph, dispatch, fetch
+        # Extract and dispatch subgraph
         subgraph = extract_subgraph(prompt, unique_id)
         prepared = prepare_for_remote(subgraph, remote_url)
         job_id = dispatch_subgraph(remote_url, prepared)
-        result = fetch_output(remote_url, job_id, output_name, "IMAGE")
 
-        if mode == "both":
-            # Could return both or log comparison
-            pass
+        return ({
+            "mode": mode,
+            "remote_url": remote_url,
+            "job_id": job_id,
+        },)
 
+
+class SubgraphFetch_IMAGE:
+    TITLE = "Fetch Subgraph Output (Image)"
+    CATEGORY = "remote/subgraph"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "remote_info": ("REMINFO",),
+                "output_name": ("STRING", {"default": "image_out"}),
+            },
+            "optional": {
+                "local_value": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "fetch"
+
+    def fetch(self, remote_info, output_name, local_value=None):
+        if remote_info.get("mode") == "local":
+            return (local_value,)
+
+        result = fetch_output(
+            remote_info["remote_url"],
+            remote_info["job_id"],
+            output_name,
+            "IMAGE"
+        )
         return (result,)
 
 # Similar classes for LATENT, MASK, INT, FLOAT, STRING
@@ -225,28 +339,36 @@ class SubgraphOutput_IMAGE:
 
 ```python
 def extract_subgraph(prompt, output_node_id):
-    """
-    Trace upstream from output node to extract subgraph.
-    Returns: (subgraph_nodes, boundary_inputs)
-    """
+    """Trace upstream from output node to find all subgraph nodes."""
     ...
 
-def prepare_for_remote(subgraph, boundary_inputs, remote_url):
+def find_boundary_inputs(prompt, subgraph_nodes):
+    """Find loader nodes that need upload handling."""
+    ...
+
+def prepare_for_remote(prompt, subgraph_nodes, boundaries, remote_url):
     """
-    Convert subgraph to standalone prompt:
+    Build standalone prompt:
     - Upload boundary inputs
-    - Replace with loader nodes
-    - Replace output markers with capture nodes
+    - Replace loaders with uploaded filenames
+    - Replace output node with capture node
     """
     ...
 
-def dispatch_subgraph(remote_url, prompt, job_id):
-    """POST prepared prompt to remote."""
+def dispatch_subgraph(remote_url, prompt):
+    """POST prepared prompt to remote /prompt."""
     ...
 
 def fetch_output(remote_url, job_id, output_name, output_type):
-    """Fetch specific output from completed job."""
+    """Poll /history and fetch specific output."""
     ...
+```
+
+### `__init__.py` (MODIFY)
+
+```python
+from .nodes.subgraph import NODE_CLASS_MAPPINGS as SubgraphNodes
+NODE_CLASS_MAPPINGS.update(SubgraphNodes)
 ```
 
 ---
@@ -254,33 +376,31 @@ def fetch_output(remote_url, job_id, output_name, output_type):
 ## Implementation Phases
 
 ### Phase 1: IMAGE only
-- [ ] `SubgraphOutput_IMAGE` node
+- [ ] `RemoteSubgraphQueue` node
+- [ ] `SubgraphFetch_IMAGE` node
 - [ ] `extract_subgraph()` - trace upstream
 - [ ] `prepare_for_remote()` - handle IMAGE boundaries
 - [ ] Basic dispatch and fetch
 
 ### Phase 2: All types
-- [ ] LATENT support (numpy serialization)
-- [ ] MASK support
-- [ ] Primitive types (direct injection)
+- [ ] `SubgraphFetch_LATENT` (numpy serialization)
+- [ ] `SubgraphFetch_MASK`
+- [ ] `SubgraphFetch_INT/FLOAT/STRING` (direct injection)
 
-### Phase 3: Multiple outputs
-- [ ] Coordinate multiple SubgraphOutput_* nodes
-- [ ] Shared dispatch, individual fetch
-
-### Phase 4: Polish
-- [ ] Error handling
+### Phase 3: Polish
+- [ ] Error handling and propagation
 - [ ] Timeout configuration
 - [ ] Progress reporting
 - [ ] Mode "both" comparison logic
+- [ ] Caching of uploaded files
 
 ---
 
 ## Key Design Decisions
 
-1. **No SubgraphInput_* nodes** - boundaries detected automatically
-2. **Subgraph extracted from main workflow** - no separate JSON needed
-3. **Dynamic prompt reading** - uses hidden `prompt` input like current nodes
-4. **Typed output nodes** - one class per whitelisted type
-5. **Mode control** - local/remote/both for testing flexibility
-6. **Remote has same models** - MODEL/CLIP/VAE referenced by name, not transferred
+1. **Follows existing pattern** - Queue returns REMINFO, Fetch receives it
+2. **Auto-detect subgraph** - Trace upstream from trigger, no manual marking
+3. **Single dispatch, multiple fetch** - One queue node, many fetch nodes
+4. **Typed fetch nodes** - One class per whitelisted type for type safety
+5. **Mode control on queue** - local/remote/both, passed via REMINFO
+6. **Remote has same models** - MODEL/CLIP/VAE referenced by name
