@@ -2,51 +2,155 @@
 
 ## Overview
 
-Add a node that executes a sub-graph on a remote ComfyUI instance. The node lives **OUTSIDE** the subgraph and acts as a bridge - accepting inputs, dispatching the subgraph to remote, and returning outputs.
+Execute sub-graphs on remote ComfyUI instances with typed boundary nodes. SubgraphInput/Output nodes live **inside** the subgraph to define its contract, making subgraphs self-documenting and testable locally.
 
 ---
 
-## UX Design
+## Node Architecture
 
-### Node: `RemoteSubgraphExecute`
+### Typed Node Classes (one per whitelisted type)
+
+| Input Nodes | Output Nodes | Fetch Nodes |
+|-------------|--------------|-------------|
+| `SubgraphInput_IMAGE` | `SubgraphOutput_IMAGE` | `SubgraphFetch_IMAGE` |
+| `SubgraphInput_LATENT` | `SubgraphOutput_LATENT` | `SubgraphFetch_LATENT` |
+| `SubgraphInput_MASK` | `SubgraphOutput_MASK` | `SubgraphFetch_MASK` |
+| `SubgraphInput_INT` | `SubgraphOutput_INT` | `SubgraphFetch_INT` |
+| `SubgraphInput_FLOAT` | `SubgraphOutput_FLOAT` | `SubgraphFetch_FLOAT` |
+| `SubgraphInput_STRING` | `SubgraphOutput_STRING` | `SubgraphFetch_STRING` |
+
+Plus: `RemoteSubgraphDispatch` - coordinator node
+
+---
+
+## Node Definitions
+
+### SubgraphInput_* (lives in subgraph AND main workflow)
 
 ```
 ┌─────────────────────────────────┐
-│   Remote Subgraph Execute       │
+│   SubgraphInput_IMAGE           │
 ├─────────────────────────────────┤
-│ remote_url: [http://...]        │
-│ workflow:   [JSON input]        │
+│ input_name: "img1"              │
 ├─────────────────────────────────┤
 │ Inputs:                         │
-│  → image_in     (IMAGE)         │
-│  → latent_in    (LATENT)        │
-│  → mask_in      (MASK)          │
-│  → int_in       (INT)           │
-│  → float_in     (FLOAT)         │
-│  → string_in    (STRING)        │
+│  → image     (IMAGE)            │
 ├─────────────────────────────────┤
 │ Outputs:                        │
-│  → image_out    (IMAGE)         │
-│  → latent_out   (LATENT)        │
-│  → mask_out     (MASK)          │
-│  → int_out      (INT)           │
-│  → float_out    (FLOAT)         │
-│  → string_out   (STRING)        │
+│  → image     (IMAGE) passthrough│
+│  → marker    (SUBGRAPH_MARKER)  │
 └─────────────────────────────────┘
 ```
 
-### Node Placement
+- **In subgraph**: Marks input boundary, value injected during remote execution
+- **In main workflow**: Receives actual value, outputs marker for dispatch ordering
+- Passthrough allows local testing of subgraph
 
-The `RemoteSubgraphExecute` node sits **outside** the subgraph as one of its inputs/outputs. This allows:
-- Same subgraph to be reused locally or remotely
-- Clean separation between workflow logic and remote execution
-- Multiple remote instances can execute same subgraph
+### SubgraphOutput_* (lives inside subgraph)
 
-### Subgraph Convention
+```
+┌─────────────────────────────────┐
+│   SubgraphOutput_IMAGE          │
+├─────────────────────────────────┤
+│ output_name: "result"           │
+├─────────────────────────────────┤
+│ Inputs:                         │
+│  → image     (IMAGE)            │
+├─────────────────────────────────┤
+│ Outputs:                        │
+│  → image     (IMAGE) passthrough│
+└─────────────────────────────────┘
+```
 
-The subgraph must have specially-named marker nodes to define boundaries:
-- **Input markers**: `SubgraphInput` nodes with typed outputs
-- **Output markers**: `SubgraphOutput` nodes with typed inputs
+- Marks output boundary in subgraph
+- During remote dispatch: replaced with capture node (PreviewImage, SaveLatentNumpy, etc.)
+- Passthrough allows local testing
+
+### RemoteSubgraphDispatch (lives in main workflow)
+
+```
+┌─────────────────────────────────┐
+│   RemoteSubgraphDispatch        │
+├─────────────────────────────────┤
+│ remote_url: [http://...]        │
+│ mode: [local/remote/both]       │
+├─────────────────────────────────┤
+│ Inputs:                         │
+│  → workflow  (JSON)             │
+│  → markers   (SUBGRAPH_MARKER)  │  ← from all SubgraphInput_* nodes
+├─────────────────────────────────┤
+│ Outputs:                        │
+│  → remote_info (REMINFO)        │
+└─────────────────────────────────┘
+```
+
+- Receives markers from all SubgraphInput nodes (enforces execution order)
+- Scans prompt to find SubgraphInput nodes and their values
+- Uploads input resources to remote
+- Dispatches modified workflow to remote
+- Returns REMINFO for fetch nodes
+
+### SubgraphFetch_* (lives in main workflow)
+
+```
+┌─────────────────────────────────┐
+│   SubgraphFetch_IMAGE           │
+├─────────────────────────────────┤
+│ output_name: "result"           │
+├─────────────────────────────────┤
+│ Inputs:                         │
+│  → remote_info (REMINFO)        │
+│  → local_value (IMAGE) optional │  ← for local/both modes
+├─────────────────────────────────┤
+│ Outputs:                        │
+│  → image     (IMAGE)            │
+└─────────────────────────────────┘
+```
+
+- Fetches specific output by `output_name` from remote
+- In `local` mode: returns local_value passthrough
+- In `remote` mode: fetches from remote
+- In `both` mode: could return both or compare
+
+---
+
+## Workflow Examples
+
+### Subgraph Definition (saved as workflow JSON)
+
+```
+┌──────────────────────┐     ┌──────────────┐     ┌───────────────────────┐
+│ SubgraphInput_IMAGE  │────→│ ImageUpscale │────→│ SubgraphOutput_IMAGE  │
+│ input_name: "img1"   │     │              │     │ output_name: "result" │
+└──────────────────────┘     └──────────────┘     └───────────────────────┘
+```
+
+This subgraph:
+- Takes one IMAGE input named "img1"
+- Outputs one IMAGE output named "result"
+- Can be tested locally (nodes passthrough)
+- Can be executed remotely via dispatch
+
+### Main Workflow (executes subgraph remotely)
+
+```
+┌───────────┐     ┌──────────────────────┐
+│ LoadImage │────→│ SubgraphInput_IMAGE  │──marker──┐
+└───────────┘     │ input_name: "img1"   │          │
+                  └──────────────────────┘          │
+                                                    ↓
+┌─────────────────────┐     ┌─────────────────────────────┐
+│ LoadDiskWorkflowJSON│────→│ RemoteSubgraphDispatch      │
+└─────────────────────┘     │ remote_url: 192.168.1.68    │
+                            │ mode: remote                │
+                            └─────────────────────────────┘
+                                          │
+                                          ↓ REMINFO
+                            ┌─────────────────────────────┐
+                            │ SubgraphFetch_IMAGE         │────→ [SaveImage]
+                            │ output_name: "result"       │
+                            └─────────────────────────────┘
+```
 
 ---
 
@@ -54,207 +158,132 @@ The subgraph must have specially-named marker nodes to define boundaries:
 
 ### Supported (can serialize/transfer):
 
-| Type | Serialization Method |
-|------|---------------------|
-| `IMAGE` | Upload via `/upload/image`, fetch via `/view` |
-| `LATENT` | Numpy `.npy` file, upload/download |
-| `MASK` | Same as IMAGE (single channel) |
-| `INT` | JSON primitive |
-| `FLOAT` | JSON primitive |
-| `STRING` | JSON primitive |
-| `BOOLEAN` | JSON primitive |
+| Type | Upload Method | Fetch Method |
+|------|---------------|--------------|
+| `IMAGE` | `/upload/image` | `/view?filename=...` |
+| `LATENT` | `/upload/image` (as .npy) | `/view?filename=...` |
+| `MASK` | `/upload/image` | `/view?filename=...` |
+| `INT` | JSON in prompt | Job metadata |
+| `FLOAT` | JSON in prompt | Job metadata |
+| `STRING` | JSON in prompt | Job metadata |
 
-### NOT Supported (remote loads its own):
+### NOT Supported:
 
 | Type | Reason |
 |------|--------|
-| `MODEL` | Too large to transfer; remote has its own checkpoints |
+| `MODEL` | Too large; remote loads its own |
 | `CLIP` | Same as MODEL |
 | `VAE` | Same as MODEL |
-| `CONDITIONING` | Complex nested structure, tied to specific CLIP |
-| Custom types | Unless explicitly added to whitelist |
-
----
-
-## Architecture
-
-### Files to Create
-
-1. **`nodes/subgraph.py`** (NEW)
-   - `RemoteSubgraphExecute` - main execution node
-   - `SubgraphInput` - marker node for subgraph inputs
-   - `SubgraphOutput` - marker node for subgraph outputs
-
-2. **`core/subgraph_dispatch.py`** (NEW)
-   - `prepare_subgraph_for_remote()` - inject inputs, configure outputs
-   - `dispatch_subgraph()` - upload resources + send prompt
-   - `fetch_subgraph_results()` - retrieve outputs from remote
-
-### Files to Modify
-
-3. **`core/dispatch.py`**
-   - Generalize `upload_input_images()` for reuse
-
-4. **`__init__.py`**
-   - Register new nodes
+| `CONDITIONING` | Complex structure, tied to CLIP |
 
 ---
 
 ## Execution Flow
 
 ```
-1. User connects inputs to RemoteSubgraphExecute node
-2. Node receives workflow JSON + input values
+1. Main workflow executes SubgraphInput_* nodes
+   - Values pass through
+   - Markers output for dispatch ordering
 
-3. prepare_subgraph_for_remote():
-   - Find SubgraphInput nodes in workflow
-   - Replace with actual input values (or upload and reference)
-   - Find SubgraphOutput nodes
-   - Replace with capture nodes (PreviewImage, SaveLatentNumpy, etc.)
+2. RemoteSubgraphDispatch executes (blocked until all markers received)
+   - Scans prompt for SubgraphInput_* nodes
+   - Collects their input values from execution cache
+   - Modifies subgraph workflow:
+     a. Replace SubgraphInput_* with actual values / uploaded file refs
+     b. Replace SubgraphOutput_* with capture nodes (PreviewImage, etc.)
+   - Uploads IMAGE/LATENT inputs to remote
+   - POSTs modified workflow to remote /prompt
+   - Returns REMINFO with job_id
 
-4. Upload resources:
-   - IMAGE inputs → POST /upload/image
-   - LATENT inputs → POST /upload/image (as .npy)
-
-5. dispatch_subgraph():
-   - POST modified workflow to remote /prompt
-   - Store job_id for tracking
-
-6. Poll for completion:
-   - GET /history until job appears with outputs
-
-7. fetch_subgraph_results():
-   - IMAGE outputs → GET /view?filename=...
-   - LATENT outputs → GET /view?filename=...
-   - Primitives → extract from job metadata
-
-8. Return outputs to local graph
+3. SubgraphFetch_* nodes execute (blocked until REMINFO received)
+   - Poll remote /history for job completion
+   - Fetch outputs by output_name:
+     - IMAGE/LATENT: GET /view?filename=...
+     - Primitives: extract from job response
+   - Return fetched values
 ```
 
 ---
 
-## Marker Node Design
+## Files to Create
 
-### SubgraphInput
+### `nodes/subgraph.py`
 
 ```python
-class SubgraphInput:
-    """
-    Marks an input boundary in a subgraph.
-    When executed remotely, this node is replaced with the actual input value.
-    """
-    TITLE = "Subgraph Input"
-    CATEGORY = "remote/subgraph"
+# Typed input nodes
+class SubgraphInput_IMAGE: ...
+class SubgraphInput_LATENT: ...
+class SubgraphInput_MASK: ...
+class SubgraphInput_INT: ...
+class SubgraphInput_FLOAT: ...
+class SubgraphInput_STRING: ...
 
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "input_name": ("STRING", {"default": "image_in"}),
-                "input_type": (["IMAGE", "LATENT", "MASK", "INT", "FLOAT", "STRING"],),
-            }
-        }
+# Typed output nodes (for inside subgraph)
+class SubgraphOutput_IMAGE: ...
+class SubgraphOutput_LATENT: ...
+class SubgraphOutput_MASK: ...
+class SubgraphOutput_INT: ...
+class SubgraphOutput_FLOAT: ...
+class SubgraphOutput_STRING: ...
 
-    # Dynamic return type based on input_type selection
-    RETURN_TYPES = ("*",)  # Wildcard, actual type determined at runtime
-    FUNCTION = "passthrough"
+# Dispatcher
+class RemoteSubgraphDispatch: ...
 
-    def passthrough(self, input_name, input_type):
-        # Returns placeholder; replaced during remote prep
-        return (None,)
+# Typed fetch nodes
+class SubgraphFetch_IMAGE: ...
+class SubgraphFetch_LATENT: ...
+class SubgraphFetch_MASK: ...
+class SubgraphFetch_INT: ...
+class SubgraphFetch_FLOAT: ...
+class SubgraphFetch_STRING: ...
 ```
 
-### SubgraphOutput
+### `core/subgraph_dispatch.py`
 
 ```python
-class SubgraphOutput:
+def prepare_subgraph_for_remote(workflow, inputs, outputs):
     """
-    Marks an output boundary in a subgraph.
-    When executed remotely, this captures the output for return.
+    Modify subgraph workflow for remote execution.
+    - Replace SubgraphInput_* with injected values
+    - Replace SubgraphOutput_* with capture nodes
     """
-    TITLE = "Subgraph Output"
-    CATEGORY = "remote/subgraph"
-    OUTPUT_NODE = True
+    ...
 
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "output_name": ("STRING", {"default": "image_out"}),
-                "value": ("*",),  # Accepts any whitelisted type
-            }
-        }
+def upload_subgraph_inputs(remote_url, inputs):
+    """Upload IMAGE/LATENT inputs to remote."""
+    ...
 
-    RETURN_TYPES = ()
-    FUNCTION = "capture"
-
-    def capture(self, output_name, value):
-        # Value is captured and returned to host
-        return {}
+def fetch_subgraph_output(remote_url, job_id, output_name, output_type):
+    """Fetch specific output from completed remote job."""
+    ...
 ```
 
 ---
 
 ## Implementation Phases
 
-### Phase 1: Basic Infrastructure
-- [ ] Create `SubgraphInput` and `SubgraphOutput` marker nodes
-- [ ] Create `RemoteSubgraphExecute` with fixed typed slots
-- [ ] Support IMAGE type only (simplest case)
-- [ ] Basic dispatch and fetch
+### Phase 1: IMAGE only
+- [ ] SubgraphInput_IMAGE, SubgraphOutput_IMAGE, SubgraphFetch_IMAGE
+- [ ] RemoteSubgraphDispatch
+- [ ] Basic upload and fetch for images
 
-### Phase 2: Full Type Support
-- [ ] Add LATENT support (numpy serialization)
-- [ ] Add MASK support
-- [ ] Add primitive types (INT, FLOAT, STRING, BOOLEAN)
-- [ ] Handle multiple inputs/outputs of same type
+### Phase 2: All types
+- [ ] LATENT, MASK support (numpy serialization)
+- [ ] INT, FLOAT, STRING support (JSON injection)
+- [ ] BOOLEAN support
 
 ### Phase 3: Polish
-- [ ] Better error handling and logging
-- [ ] Progress reporting during remote execution
-- [ ] Caching of uploaded resources
+- [ ] Error handling and propagation
 - [ ] Timeout configuration
+- [ ] Progress reporting
+- [ ] Caching of uploads
 
 ---
 
-## Example Usage
+## Key Design Decisions
 
-### Main Workflow (runs locally)
-
-```
-[LoadImage] ─────────────────────┐
-                                 ↓
-                    ┌────────────────────────┐
-                    │ RemoteSubgraphExecute  │
-                    │  remote_url: 192.168.1.68:8199
-                    │  workflow: [JSON]      │
-                    └────────────────────────┘
-                                 ↓
-                          [SaveImage]
-```
-
-### Subgraph (saved as JSON, runs on remote)
-
-```
-[SubgraphInput] ──→ [ImageUpscale] ──→ [SubgraphOutput]
-   input_name: "image_in"              output_name: "image_out"
-```
-
----
-
-## Key Considerations
-
-1. **Resource Upload**: Reuse pattern from `upload_input_images()`
-2. **Polling**: Use existing `wait_for_job()` from `fetch.py`
-3. **Type Safety**: Validate connected types match marker declarations
-4. **Error Propagation**: Surface remote errors to local UI
-5. **Timeout**: Configurable for long-running subgraphs
-6. **Idempotency**: Same inputs should produce same outputs (caching)
-
----
-
-## Open Questions
-
-1. Should multiple inputs/outputs of same type use numbered slots (`image_in_1`, `image_in_2`) or named slots?
-2. How to handle subgraph validation before execution (check all marker nodes exist)?
-3. Should there be a "dry run" mode that validates without executing?
+1. **Typed node classes** - One class per whitelisted type for type safety
+2. **Subgraph contains Output nodes** - Self-documenting, testable locally
+3. **Marker-based ordering** - SubgraphInput markers enforce dispatch waits for all inputs
+4. **Separate Fetch nodes** - Allows multiple outputs, clear data flow
+5. **Mode control on Dispatch** - local/remote/both for testing flexibility
