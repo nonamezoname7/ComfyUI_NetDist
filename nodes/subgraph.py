@@ -20,9 +20,10 @@ class RemoteSubgraphQueue:
     """
     Extract a subgraph from the workflow and dispatch to remote.
 
-    Uses rawLink to receive the trigger connection without executing
-    upstream nodes locally. The subgraph is sent to remote for execution.
-    Returns REMINFO for use with SubgraphFetch_* nodes.
+    Uses lazy=True to prevent upstream nodes from being scheduled initially,
+    combined with rawLink=True to receive the trigger link [node_id, slot]
+    without triggering local execution. check_lazy_status returns [] to
+    ensure upstream is never requested.
     """
 
     TITLE = "Queue Subgraph on Remote"
@@ -35,7 +36,7 @@ class RemoteSubgraphQueue:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "trigger": ("IMAGE", {"rawLink": True}),
+                "trigger": ("IMAGE", {"lazy": True, "rawLink": True}),
                 "remote_url": ("STRING", {
                     "default": "http://127.0.0.1:8288",
                     "multiline": False,
@@ -47,6 +48,17 @@ class RemoteSubgraphQueue:
                 "unique_id": "UNIQUE_ID",
             },
         }
+
+    def check_lazy_status(self, trigger, remote_url, mode, dynprompt, unique_id):
+        """
+        Never request the trigger input - we only need the link reference.
+
+        Returns:
+            list: Empty list - no inputs need evaluation.
+        """
+        # We never need the actual IMAGE data, only the link [node_id, slot]
+        # which we get via rawLink. Return empty list to prevent upstream execution.
+        return []
 
     def queue(self, trigger, remote_url, mode, dynprompt, unique_id):
         """

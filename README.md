@@ -55,6 +55,33 @@ Workflow JSON: [NetDistAdvancedV2.json](https://github.com/city96/ComfyUI_NetDis
 
 ![NetDistSaved](https://github.com/city96/ComfyUI_NetDist/assets/125218114/a39b5117-af1b-4f2c-a94e-5a330acc8ea4)
 
+#### Remote Subgraph Execution
+
+Execute only a portion of your workflow on a remote instance. This is useful when you want to offload heavy processing (like sampling) to a remote GPU while keeping lightweight operations local.
+
+**Nodes:**
+- `RemoteSubgraphQueue` - Connect to the output of the subgraph you want to run remotely. It automatically traces upstream to find all dependent nodes and dispatches them to the remote instance.
+- `SubgraphFetch_IMAGE` - Fetches the IMAGE result from the remote execution.
+
+**How it works:**
+1. Connect `RemoteSubgraphQueue` to the node output you want to capture (e.g., VAEDecode output)
+2. The node traces upstream to find all dependent nodes
+3. Input images are automatically uploaded to the remote instance
+4. The subgraph is dispatched to the remote for execution
+5. Use `SubgraphFetch_IMAGE` to retrieve the result
+
+**Key feature:** Models are NOT loaded locally - only the remote instance loads checkpoints and runs inference. This is achieved using ComfyUI's lazy evaluation system to prevent local execution of the subgraph.
+
+```
+[LoadImage] → [VAEEncode] → [KSampler] → [VAEDecode] → [RemoteSubgraphQueue]
+                                                              ↓
+                                                         [SubgraphFetch_IMAGE] → [SaveImage]
+```
+
+**Requirements:**
+- Remote instance must have the same models/checkpoints available by name
+- Remote instance must have `--listen` flag if on a different machine
+
 ### Remote images
 The `LoadImageUrl` ('Load Image (URL)') Node acts just like the normal 'Load Image' node.
 
